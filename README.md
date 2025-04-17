@@ -23,7 +23,7 @@ A decentralized logistics and escrow system enabling secure marketplace transact
 
 ```bash
 git clone https://github.com/Dezenmart-STORE/dezenmart-smart_contract.git
-cd DezenMartLogistics
+cd dezenmart-smart_contract
 forge install
 ```
 
@@ -103,6 +103,3 @@ MIT License
 
 Feel free to open issues or PRs. For questions, connect with the maintainer.
 
----
-
-Let me know if you'd like to include a logo, badges (build, license, audit status), or a usage example with UI!
