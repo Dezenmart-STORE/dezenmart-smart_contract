@@ -22,7 +22,7 @@ A decentralized logistics and escrow system enabling secure marketplace transact
 ## ⚙️ Setup
 
 ```bash
-git clone https://github.com/your-username/DezenMartLogistics.git
+git clone https://github.com/Dezenmart-STORE/dezenmart-smart_contract.git
 cd DezenMartLogistics
 forge install
 ```
