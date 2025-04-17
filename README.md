@@ -1,66 +1,112 @@
-## Foundry
+Got it! Here’s a properly structured `README.md` file for your **DezenMartLogistics** Foundry-based smart contract project, formatted in clean markdown and tailored for GitHub:
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+---
 
-Foundry consists of:
+```markdown
+# DezenMartLogistics
 
--   **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
--   **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
--   **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
--   **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+A decentralized logistics and escrow system enabling secure marketplace transactions with optional logistics provider integration. Built with Solidity and Foundry, the contract ensures secure fund handling, supports ETH and USDT payments, and enables dispute resolution with minimal platform fees.
 
-## Documentation
+## 🔍 Features
 
-https://book.getfoundry.sh/
+- 🔐 **Escrow Mechanism** – Ensures funds are locked until delivery is confirmed.
+- 💱 **Dual Payment Support** – Accepts both ETH and USDT.
+- 🚚 **Optional Logistics Integration** – Users can select a logistics provider.
+- ⚖️ **Dispute Resolution** – Admin-resolved disputes with event logs.
+- 🧾 **Event Transparency** – Emits events for every major action.
+- 💰 **Platform Fee** – 2.5% charged on logistics only.
 
-## Usage
+## 🛠 Prerequisites
 
-### Build
+- [Foundry](https://book.getfoundry.sh/getting-started/installation)
+- [Node.js](https://nodejs.org/)
+- An Ethereum wallet (e.g., MetaMask)
+- RPC URL (e.g.,Alfajore Testnet)
 
-```shell
-$ forge build
+## ⚙️ Setup
+
+```bash
+git clone https://github.com/your-username/DezenMartLogistics.git
+cd DezenMartLogistics
+forge install
 ```
 
-### Test
+## 📁 Project Structure
 
-```shell
-$ forge test
+```
+src/                   → Smart contracts
+├── Logistics.sol
+test/                  → Foundry tests
+foundry.toml           → Foundry config
+README.md              → Project docs
 ```
 
-### Format
+## 🧪 Testing
 
-```shell
-$ forge fmt
+```bash
+forge test
 ```
 
-### Gas Snapshots
+## 🚀 Deployment
 
-```shell
-$ forge snapshot
+Use the constructor to deploy with a USDT token address:
+
+```solidity
+constructor(address _usdtAddress)
 ```
 
-### Anvil
+## 🔗 Configuring `foundry.toml`
 
-```shell
-$ anvil
+```toml
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+
+[rpc_endpoints]
+Testneturl = "https://public-node.testnet.co"
+
+[etherscan]
+key = { Testnet = "PLACEHOLDER_API_KEY" }
+
+chains = [
+  { 
+    name = "Testnet", 
+    chain_id = 3100, 
+    explorer = "https://testnet.blockscout.com", 
+    api_url = "https://testnet.blockscout.com/api"
+  },
+]
 ```
 
-### Deploy
+> 📌 Replace `PLACEHOLDER_API_KEY` with any non-empty string (required for Foundry).
 
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
-```
+## 📜 Key Functions
 
-### Cast
+- `registerSeller()`
+- `registerLogisticsProvider(address)`
+- `createTrade(...)`
+- `confirmDelivery(uint256)`
+- `cancelTrade(uint256)`
+- `raiseDispute(uint256)`
+- `resolveDispute(uint256, address)`
+- `withdrawEscrowFeesETH()`
+- `withdrawEscrowFeesUSDT()`
 
-```shell
-$ cast <subcommand>
-```
+## 🔐 Admin Controls
 
-### Help
+- Whitelist logistics providers
+- Resolve disputes
+- Withdraw fees
 
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+## 📄 License
+
+MIT License
+
+## 🤝 Contributing
+
+Feel free to open issues or PRs. For questions, connect with the maintainer.
+
+---
+
+Let me know if you'd like to include a logo, badges (build, license, audit status), or a usage example with UI!
