@@ -1,6 +1,4 @@
 
-
-```markdown
 # DezenMartLogistics
 
 A decentralized logistics and escrow system enabling secure marketplace transactions with optional logistics provider integration. Built with Solidity and Foundry, the contract ensures secure fund handling, supports ETH and USDT payments, and enables dispute resolution with minimal platform fees.
