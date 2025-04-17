@@ -1,6 +1,4 @@
-Got it! Here’s a properly structured `README.md` file for your **DezenMartLogistics** Foundry-based smart contract project, formatted in clean markdown and tailored for GitHub:
 
----
 
 ```markdown
 # DezenMartLogistics
