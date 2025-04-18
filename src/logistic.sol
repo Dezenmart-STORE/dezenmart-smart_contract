@@ -2,7 +2,6 @@
 pragma solidity ^0.8.20;
 
 import "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
-
 contract DezenMartLogistics {
     // Constants
     uint256 public constant ESCROW_FEE_PERCENT = 250; // 2.5% (in basis points, 10000 = 100%)
@@ -19,10 +18,10 @@ contract DezenMartLogistics {
         address buyer;
         address seller;
         address logisticsProvider; // Zero address if no logistics
-        uint256 productCost;
-        uint256 logisticsCost;
-        uint256 escrowFee;
-        uint256 totalAmount;
+        uint256 productCost; // In smallest unit (micro-USDT for USDT, wei for ETH)
+        uint256 logisticsCost; // In smallest unit, provided by buyer if logistics selected
+        uint256 escrowFee; // In smallest unit, 2.5% of productCost + 2.5% of logisticsCost
+        uint256 totalAmount; // In smallest unit, productCost + logisticsCost
         bool logisticsSelected;
         bool delivered;
         bool completed;
@@ -34,15 +33,19 @@ contract DezenMartLogistics {
     mapping(uint256 => Trade) public trades;
     uint256 public tradeCounter;
     mapping(uint256 => bool) public disputesResolved;
+    mapping(address => uint256[]) public buyerTrades; // Tracks trade IDs per buyer
 
     // Events
-    event TradeCreated(uint256 tradeId, address buyer, address seller, address logisticsProvider, uint256 totalAmount, bool isUSDT);
-    event LogisticsSelected(uint256 tradeId, address logisticsProvider, uint256 logisticsCost);
-    event PaymentHeld(uint256 tradeId, uint256 totalAmount, bool isUSDT);
-    event DeliveryConfirmed(uint256 tradeId);
-    event PaymentSettled(uint256 tradeId, uint256 sellerAmount, uint256 logisticsAmount, bool isUSDT);
-    event DisputeRaised(uint256 tradeId, address initiator);
-    event DisputeResolved(uint256 tradeId, address winner, bool isUSDT);
+    event TradeCreated(uint256 indexed tradeId, address indexed buyer, address seller, address logisticsProvider, uint256 totalAmount, bool isUSDT);
+    event LogisticsSelected(uint256 indexed tradeId, address logisticsProvider, uint256 logisticsCost);
+    event PaymentHeld(uint256 indexed tradeId, uint256 totalAmount, bool isUSDT);
+    event DeliveryConfirmed(uint256 indexed tradeId);
+    event PaymentSettled(uint256 indexed tradeId, uint256 sellerAmount, uint256 logisticsAmount, bool isUSDT);
+    event DisputeRaised(uint256 indexed tradeId, address initiator);
+    event DisputeResolved(uint256 indexed tradeId, address winner, bool isUSDT);
+
+    // Errors
+    error InsufficientUSDTAllowance(uint256 needed, uint256 allowance);
 
     // Modifiers
     modifier onlyAdmin() {
@@ -82,17 +85,21 @@ contract DezenMartLogistics {
         uint256 logisticsCost,
         bool useUSDT
     ) external payable returns (uint256) {
+        require(msg.sender != admin, "Admin cannot be a buyer");
         require(sellers[seller], "Invalid seller");
         require(logisticsProvider == address(0) || logisticsProviders[logisticsProvider], "Invalid logistics provider");
+        require(logisticsProvider == address(0) ? logisticsCost == 0 : logisticsCost > 0, "Invalid logistics cost");
 
         bool logisticsSelected = logisticsProvider != address(0);
-        uint256 totalCost = productCost + (logisticsSelected ? logisticsCost : 0);
-        uint256 escrowFee = (totalCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
-        uint256 totalAmount = totalCost + escrowFee;
+        uint256 productEscrowFee = (productCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
+        uint256 logisticsEscrowFee = (logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
+        uint256 escrowFee = productEscrowFee + logisticsEscrowFee;
+        uint256 totalAmount = productCost + logisticsCost;
 
-        // Handle payment based on useUSDT flag
         if (useUSDT) {
             require(msg.value == 0, "ETH sent for USDT payment");
+            uint256 allowance = usdt.allowance(msg.sender, address(this));
+            if (allowance < totalAmount) revert InsufficientUSDTAllowance(totalAmount, allowance);
             require(usdt.transferFrom(msg.sender, address(this), totalAmount), "USDT transfer failed");
         } else {
             require(msg.value == totalAmount, "Incorrect ETH amount");
@@ -116,6 +123,9 @@ contract DezenMartLogistics {
             isUSDT: useUSDT
         });
 
+        // Track trade ID for buyer
+        buyerTrades[msg.sender].push(tradeId);
+
         emit TradeCreated(tradeId, msg.sender, seller, logisticsProvider, totalAmount, useUSDT);
         if (logisticsSelected) {
             emit LogisticsSelected(tradeId, logisticsProvider, logisticsCost);
@@ -123,6 +133,18 @@ contract DezenMartLogistics {
         emit PaymentHeld(tradeId, totalAmount, useUSDT);
 
         return tradeId;
+    }
+
+    // Get all trade details for the caller (buyer)
+    function getTradesByBuyer() external view returns (Trade[] memory) {
+        uint256[] memory tradeIds = buyerTrades[msg.sender];
+        Trade[] memory buyerTradeDetails = new Trade[](tradeIds.length);
+
+        for (uint256 i = 0; i < tradeIds.length; i++) {
+            buyerTradeDetails[i] = trades[tradeIds[i]];
+        }
+
+        return buyerTradeDetails;
     }
 
     // Confirm delivery (buyer)
@@ -148,8 +170,9 @@ contract DezenMartLogistics {
 
         trade.completed = true;
 
-        // Seller receives full product cost
-        uint256 sellerAmount = trade.productCost;
+        // Seller receives product cost minus 2.5% escrow fee
+        uint256 productEscrowFee = (trade.productCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
+        uint256 sellerAmount = trade.productCost - productEscrowFee;
         if (trade.isUSDT) {
             require(usdt.transfer(trade.seller, sellerAmount), "USDT transfer to seller failed");
         } else {
@@ -159,8 +182,8 @@ contract DezenMartLogistics {
         // Logistics provider receives logistics cost minus 2.5% escrow fee
         uint256 logisticsAmount = 0;
         if (trade.logisticsSelected) {
-            uint256 logisticsFee = (trade.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
-            logisticsAmount = trade.logisticsCost - logisticsFee;
+            uint256 logisticsEscrowFee = (trade.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
+            logisticsAmount = trade.logisticsCost - logisticsEscrowFee;
             if (trade.isUSDT) {
                 require(usdt.transfer(trade.logisticsProvider, logisticsAmount), "USDT transfer to logistics failed");
             } else {
@@ -168,7 +191,7 @@ contract DezenMartLogistics {
             }
         }
 
-        // Escrow fee remains in contract (admin can withdraw separately)
+        // Escrow fee remains in contract (admin can withdraw)
         emit PaymentSettled(tradeId, sellerAmount, logisticsAmount, trade.isUSDT);
     }
 
@@ -197,25 +220,29 @@ contract DezenMartLogistics {
 
         // Refund or distribute funds based on admin decision
         if (winner == trade.buyer) {
+            // Refund full amount
             if (trade.isUSDT) {
                 require(usdt.transfer(trade.buyer, trade.totalAmount), "USDT refund failed");
             } else {
                 payable(trade.buyer).transfer(trade.totalAmount);
             }
         } else {
-            // Seller gets product cost
+            // Seller gets product cost minus 2.5% escrow fee
+            uint256 productEscrowFee = (trade.productCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
+            uint256 sellerAmount = trade.productCost - productEscrowFee;
             if (trade.isUSDT) {
-                require(usdt.transfer(trade.seller, trade.productCost), "USDT transfer to seller failed");
+                require(usdt.transfer(trade.seller, sellerAmount), "USDT transfer to seller failed");
             } else {
-                payable(trade.seller).transfer(trade.productCost);
+                payable(trade.seller).transfer(sellerAmount);
             }
-            // Logistics provider gets logistics cost minus escrow fee
+            // Logistics provider gets logistics cost minus 2.5% escrow fee
             if (trade.logisticsSelected) {
-                uint256 logisticsFee = (trade.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
+                uint256 logisticsEscrowFee = (trade.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
+                uint256 logisticsPayout = trade.logisticsCost - logisticsEscrowFee;
                 if (trade.isUSDT) {
-                    require(usdt.transfer(trade.logisticsProvider, trade.logisticsCost - logisticsFee), "USDT transfer to logistics failed");
+                    require(usdt.transfer(trade.logisticsProvider, logisticsPayout), "USDT transfer to logistics failed");
                 } else {
-                    payable(trade.logisticsProvider).transfer(trade.logisticsCost - logisticsFee);
+                    payable(trade.logisticsProvider).transfer(logisticsPayout);
                 }
             }
         }
@@ -246,6 +273,7 @@ contract DezenMartLogistics {
         require(!trade.completed, "Trade already completed");
 
         trade.completed = true;
+        // Refund full amount
         if (trade.isUSDT) {
             require(usdt.transfer(trade.buyer, trade.totalAmount), "USDT refund failed");
         } else {
