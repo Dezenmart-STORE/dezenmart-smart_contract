@@ -10,76 +10,111 @@ contract DezenMartLogistics is Ownable {
     uint256 public constant BASIS_POINTS = 10000;
 
     // Roles
-    IERC20 public usdt; // USDT contract address
+    IERC20 public immutable usdt;
     mapping(address => bool) public logisticsProviders;
     mapping(address => bool) public sellers;
+    mapping(address => bool) public buyers; // Track registered buyers
+    address[] public registeredProviders;
+
+    // Purchase structure for individual buyer purchases
+    struct Purchase {
+        uint256 purchaseId;
+        uint256 tradeId;
+        address buyer;
+        uint256 quantity;
+        uint256 totalAmount;
+        bool delivered;
+        bool confirmed;
+        bool disputed;
+        address chosenLogisticsProvider;
+        uint256 logisticsCost;
+    }
 
     // Trade structure
     struct Trade {
-        address buyer; // Set when buyer purchases the trade
-        address seller; // Set when seller creates the trade
-        address[] logisticsProviders; // List of available logistics providers
-        uint256[] logisticsCosts; // Corresponding costs for each provider
-        address chosenLogisticsProvider; // Provider selected by buyer
-        uint256 productCost; // In smallest unit (micro-USDT for USDT, wei for ETH)
-        uint256 logisticsCost; // Cost of chosen provider, set by buyer
-        uint256 escrowFee; // 2.5% of productCost + 2.5% of logisticsCost
-        uint256 totalAmount; // productCost + logisticsCost
-        uint256 totalQuantity; // Total number of goods purchased in this trade
-        uint256 remainingQuantity; // Remaining goods available (for seller trades)
-        bool logisticsSelected; // True if buyer selects a provider
-        bool delivered; // True if delivery is confirmed
-        bool completed; // True if trade is settled or canceled
-        bool disputed; // True if dispute is raised
-        bool isUSDT; // True for USDT, false for ETH
-        uint256 parentTradeId; // Links to original trade ID (0 for seller trades)
+        address seller;
+        address[] logisticsProviders;
+        uint256[] logisticsCosts;
+        uint256 productCost;
+        uint256 escrowFee;
+        uint256 totalQuantity;
+        uint256 remainingQuantity;
+        bool active;
+        uint256[] purchaseIds; // Array of associated purchase IDs
     }
 
     // State variables
     mapping(uint256 => Trade) public trades;
+    mapping(uint256 => Purchase) public purchases;
     uint256 public tradeCounter;
+    uint256 public purchaseCounter;
     mapping(uint256 => bool) public disputesResolved;
-    mapping(address => uint256[]) public buyerTrades; // Tracks trade IDs per buyer
-    mapping(address => uint256[]) public sellerTrades; // Tracks original trade IDs per seller
+    mapping(address => uint256[]) public buyerPurchaseIds; // Buyer's purchase IDs
+    mapping(address => uint256[]) public sellerTradeIds; // Seller's trade IDs
+    mapping(address => uint256[]) public providerTradeIds; // Logistics provider's trade IDs
 
     // Events
-    event TradeCreated(uint256 indexed tradeId, address indexed seller, address[] logisticsProviders, uint256 productCost, uint256[] logisticsCosts, uint256 totalQuantity, bool isUSDT);
-    event TradePurchased(uint256 indexed tradeId, uint256 indexed parentTradeId, address indexed buyer, uint256 totalAmount, uint256 quantity, address chosenLogisticsProvider, bool isUSDT);
-    event LogisticsSelected(uint256 indexed tradeId, address logisticsProvider, uint256 logisticsCost);
-    event PaymentHeld(uint256 indexed tradeId, uint256 totalAmount, bool isUSDT);
-    event DeliveryConfirmed(uint256 indexed tradeId);
-    event PaymentSettled(uint256 indexed tradeId, uint256 sellerAmount, uint256 logisticsAmount, bool isUSDT);
-    event DisputeRaised(uint256 indexed tradeId, address initiator);
-    event DisputeResolved(uint256 indexed tradeId, address winner, bool isUSDT);
+    event TradeCreated(uint256 indexed tradeId, address indexed seller, uint256 productCost, uint256 totalQuantity);
+    event PurchaseCreated(uint256 indexed purchaseId, uint256 indexed tradeId, address indexed buyer, uint256 quantity);
+    event LogisticsSelected(uint256 indexed purchaseId, address logisticsProvider, uint256 logisticsCost);
+    event PaymentHeld(uint256 indexed purchaseId, uint256 totalAmount);
+    event DeliveryConfirmed(uint256 indexed purchaseId);
+    event PurchaseConfirmed(uint256 indexed purchaseId);
+    event PaymentSettled(uint256 indexed purchaseId, uint256 sellerAmount, uint256 logisticsAmount);
+    event DisputeRaised(uint256 indexed purchaseId, address initiator);
+    event DisputeResolved(uint256 indexed purchaseId, address winner);
+    event LogisticsProviderRegistered(address indexed provider);
+    event TradeStatusUpdated(uint256 indexed tradeId, string status);
 
     // Errors
     error InsufficientUSDTAllowance(uint256 needed, uint256 allowance);
+    error InsufficientUSDTBalance(uint256 needed, uint256 balance);
     error InvalidTradeId(uint256 tradeId);
+    error InvalidPurchaseId(uint256 purchaseId);
     error BuyerIsSeller();
     error InsufficientQuantity(uint256 requested, uint256 available);
     error InvalidQuantity(uint256 quantity);
-    error InvalidLogisticsProvider(uint256 index);
+    error InvalidLogisticsProvider(address provider);
     error MismatchedArrays(uint256 providersLength, uint256 costsLength);
     error NoLogisticsProviders();
+    error TradeNotFound(uint256 tradeId);
+    error PurchaseNotFound(uint256 purchaseId);
+    error NotAuthorized(address caller, string role);
+    error InvalidTradeState(uint256 tradeId, string expectedState);
+    error InvalidPurchaseState(uint256 purchaseId, string expectedState);
 
-    // Modifier for trade participants
-    modifier onlyTradeParticipant(uint256 tradeId) {
-        Trade memory trade = trades[tradeId];
-        bool isParticipant = msg.sender == trade.buyer || msg.sender == trade.seller;
-        if (trade.logisticsSelected) {
-            isParticipant = isParticipant || msg.sender == trade.chosenLogisticsProvider;
-        }
-        require(isParticipant, "Not a trade participant");
+    // Modifier for purchase participants
+    modifier onlyPurchaseParticipant(uint256 purchaseId) {
+        Purchase memory purchase = purchases[purchaseId];
+        Trade memory trade = trades[purchase.tradeId];
+        bool isParticipant = msg.sender == purchase.buyer || msg.sender == trade.seller;
+        isParticipant = isParticipant || msg.sender == purchase.chosenLogisticsProvider;
+        require(isParticipant, "Not a purchase participant");
         _;
     }
 
     constructor(address _usdtAddress) Ownable(msg.sender) {
+        require(_usdtAddress != address(0), "Invalid USDT address");
         usdt = IERC20(_usdtAddress);
     }
 
     // Register logistics provider
-    function registerLogisticsProvider(address provider) external onlyOwner {
+    function registerLogisticsProvider(address provider) external  {
+        require(provider != address(0), "Invalid provider address");
+        require(!logisticsProviders[provider], "Provider already registered");
         logisticsProviders[provider] = true;
+        registeredProviders.push(provider);
+        emit LogisticsProviderRegistered(provider);
+    }
+
+    // Get all registered logistics providers
+    function getLogisticsProviders() external view returns (address[] memory) {
+        return registeredProviders;
+    }
+
+    // Register buyer
+    function registerBuyer() public {
+        buyers[msg.sender] = true;
     }
 
     // Register seller
@@ -87,267 +122,277 @@ contract DezenMartLogistics is Ownable {
         sellers[msg.sender] = true;
     }
 
-    // Seller creates a trade with multiple goods and logistics options
+    // Seller creates a trade
     function createTrade(
         uint256 productCost,
         address[] memory logisticsProvidersList,
         uint256[] memory logisticsCosts,
-        bool useUSDT,
         uint256 totalQuantity
     ) external returns (uint256) {
         registerSeller();
-        require(totalQuantity > 0, "Quantity must be greater than zero");
-        require(logisticsProvidersList.length == logisticsCosts.length, "Mismatched providers and costs");
-        require(logisticsProvidersList.length > 0, "At least one logistics provider required");
+        if (totalQuantity == 0) revert InvalidQuantity(totalQuantity);
+        if (logisticsProvidersList.length != logisticsCosts.length) revert MismatchedArrays(logisticsProvidersList.length, logisticsCosts.length);
+        if (logisticsProvidersList.length == 0) revert NoLogisticsProviders();
 
         for (uint256 i = 0; i < logisticsProvidersList.length; i++) {
-            require(logisticsProvidersList[i] != address(0), "Invalid logistics provider");
-            require(logisticsProviders[logisticsProvidersList[i]], "Unregistered logistics provider");
-            require(logisticsCosts[i] > 0, "Invalid logistics cost");
+            if (logisticsProvidersList[i] == address(0) || !logisticsProviders[logisticsProvidersList[i]]) 
+                revert InvalidLogisticsProvider(logisticsProvidersList[i]);
+            if (logisticsCosts[i] == 0) revert InvalidQuantity(logisticsCosts[i]);
         }
 
         uint256 productEscrowFee = (productCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
-        uint256 totalAmount = productCost;
 
         tradeCounter++;
         uint256 tradeId = tradeCounter;
 
         trades[tradeId] = Trade({
-            buyer: address(0),
             seller: msg.sender,
             logisticsProviders: logisticsProvidersList,
             logisticsCosts: logisticsCosts,
-            chosenLogisticsProvider: address(0),
             productCost: productCost,
-            logisticsCost: 0,
             escrowFee: productEscrowFee,
-            totalAmount: totalAmount,
             totalQuantity: totalQuantity,
             remainingQuantity: totalQuantity,
-            logisticsSelected: true,
-            delivered: false,
-            completed: false,
-            disputed: false,
-            isUSDT: useUSDT,
-            parentTradeId: 0
+            active: true,
+            purchaseIds: new uint256[](0)
         });
 
-        sellerTrades[msg.sender].push(tradeId);
-
-        emit TradeCreated(tradeId, msg.sender, logisticsProvidersList, productCost, logisticsCosts, totalQuantity, useUSDT);
-        for (uint256 i = 0; i < logisticsProvidersList.length; i++) {
-            emit LogisticsSelected(tradeId, logisticsProvidersList[i], logisticsCosts[i]);
-        }
-
+        sellerTradeIds[msg.sender].push(tradeId);
+        emit TradeCreated(tradeId, msg.sender, productCost, totalQuantity);
         return tradeId;
     }
 
-    // Buyer purchases a trade with specified quantity and logistics provider
-    function buyTrade(uint256 tradeId, uint256 quantity, uint256 logisticsProviderIndex) external payable returns (uint256) {
-        Trade storage originalTrade = trades[tradeId];
-        require(originalTrade.seller != address(0), "Invalid trade ID");
-        require(originalTrade.remainingQuantity >= quantity, "Insufficient quantity available");
-        require(quantity > 0, "Quantity must be greater than zero");
-        require(msg.sender != originalTrade.seller, "Buyer cannot be the seller");
-        require(msg.sender != owner(), "Admin cannot be a buyer");
-        require(logisticsProviderIndex < originalTrade.logisticsProviders.length, "Invalid logistics provider index");
+    // Buyer purchases a trade
+    function buyTrade(uint256 tradeId, uint256 quantity, address logisticsProvider) external returns (uint256) {
+        registerBuyer();
+        Trade storage trade = trades[tradeId];
+        if (!trade.active) revert InvalidTradeId(tradeId);
+        if (trade.remainingQuantity < quantity) revert InsufficientQuantity(quantity, trade.remainingQuantity);
+        if (quantity == 0) revert InvalidQuantity(quantity);
+        if (msg.sender == trade.seller) revert BuyerIsSeller();
+        if (msg.sender == owner()) revert NotAuthorized(msg.sender, "admin as buyer");
 
-        address chosenProvider = originalTrade.logisticsProviders[logisticsProviderIndex];
-        uint256 chosenLogisticsCost = originalTrade.logisticsCosts[logisticsProviderIndex];
+        // Validate logistics provider and get cost
+        uint256 chosenLogisticsCost = _findLogisticsCost(trade, logisticsProvider);
 
-        uint256 totalProductCost = originalTrade.productCost * quantity;
-        uint256 totalLogisticsCost = chosenLogisticsCost * quantity;
-        uint256 productEscrowFee = originalTrade.escrowFee * quantity;
-        uint256 logisticsEscrowFee = (chosenLogisticsCost * ESCROW_FEE_PERCENT * quantity) / BASIS_POINTS;
-        uint256 totalEscrowFee = productEscrowFee + logisticsEscrowFee;
-        uint256 totalAmount = totalProductCost + totalLogisticsCost;
+        // Calculate costs (only return needed values)
+        (uint256 totalLogisticsCost, uint256 totalAmount) = _calculateTradeCosts(trade, quantity, chosenLogisticsCost);
 
-        if (originalTrade.isUSDT) {
-            require(msg.value == 0, "ETH sent for USDT payment");
-            uint256 allowance = usdt.allowance(msg.sender, address(this));
-            if (allowance < totalAmount) revert InsufficientUSDTAllowance(totalAmount, allowance);
-            require(usdt.transferFrom(msg.sender, address(this), totalAmount), "USDT transfer failed");
-        } else {
-            require(msg.value == totalAmount, "Incorrect ETH amount");
-        }
+        // Validate and transfer USDT
+        _validateAndTransferUSDT(totalAmount);
 
-        tradeCounter++;
-        uint256 newTradeId = tradeCounter;
+        // Create new purchase
+        purchaseCounter++;
+        uint256 purchaseId = purchaseCounter;
 
-        trades[newTradeId] = Trade({
+        purchases[purchaseId] = Purchase({
+            purchaseId: purchaseId,
+            tradeId: tradeId,
             buyer: msg.sender,
-            seller: originalTrade.seller,
-            logisticsProviders: originalTrade.logisticsProviders,
-            logisticsCosts: originalTrade.logisticsCosts,
-            chosenLogisticsProvider: chosenProvider,
-            productCost: totalProductCost,
-            logisticsCost: totalLogisticsCost,
-            escrowFee: totalEscrowFee,
+            quantity: quantity,
             totalAmount: totalAmount,
-            totalQuantity: quantity,
-            remainingQuantity: 0,
-            logisticsSelected: true,
             delivered: false,
-            completed: false,
+            confirmed: false,
             disputed: false,
-            isUSDT: originalTrade.isUSDT,
-            parentTradeId: tradeId
+            chosenLogisticsProvider: logisticsProvider,
+            logisticsCost: totalLogisticsCost
         });
 
-        buyerTrades[msg.sender].push(newTradeId);
-        originalTrade.remainingQuantity -= quantity;
+        // Update state
+        trade.purchaseIds.push(purchaseId);
+        trade.remainingQuantity -= quantity;
+        buyerPurchaseIds[msg.sender].push(purchaseId);
+        providerTradeIds[logisticsProvider].push(purchaseId);
 
-emit TradePurchased(newTradeId, tradeId, msg.sender, totalAmount, quantity, chosenProvider, originalTrade.isUSDT);        emit PaymentHeld(newTradeId, totalAmount, originalTrade.isUSDT);
-        emit LogisticsSelected(newTradeId, chosenProvider, totalLogisticsCost);
+        // Emit events
+        emit PurchaseCreated(purchaseId, tradeId, msg.sender, quantity);
+        emit PaymentHeld(purchaseId, totalAmount);
+        emit LogisticsSelected(purchaseId, logisticsProvider, totalLogisticsCost);
 
-        return newTradeId;
+        return purchaseId;
     }
 
-    // Get all trade details for the caller (buyer)
-    function getTradesByBuyer() external view returns (Trade[] memory) {
-        uint256[] memory tradeIds = buyerTrades[msg.sender];
-        Trade[] memory buyerTradeDetails = new Trade[](tradeIds.length);
-
-        for (uint256 i = 0; i < tradeIds.length; i++) {
-            buyerTradeDetails[i] = trades[tradeIds[i]];
-        }
-
-        return buyerTradeDetails;
-    }
-
-    // Get all trade details for the caller (seller)
-    function getTradesBySeller() external view returns (Trade[] memory) {
-        uint256[] memory tradeIds = sellerTrades[msg.sender];
-        Trade[] memory sellerTradeDetails = new Trade[](tradeIds.length);
-
-        for (uint256 i = 0; i < tradeIds.length; i++) {
-            sellerTradeDetails[i] = trades[tradeIds[i]];
-        }
-
-        return sellerTradeDetails;
-    }
-
-    // Confirm delivery (buyer)
-    function confirmDelivery(uint256 tradeId) external {
-        Trade storage trade = trades[tradeId];
-        require(msg.sender == trade.buyer, "Only buyer can confirm delivery");
-        require(!trade.delivered, "Already delivered");
-        require(!trade.disputed, "Trade in dispute");
-        require(!trade.completed, "Trade already completed");
-
-        trade.delivered = true;
-        emit DeliveryConfirmed(tradeId);
-        settlePayments(tradeId);
-    }
-
-    // Settle payments to seller and logistics provider
-    function settlePayments(uint256 tradeId) internal {
-        Trade storage trade = trades[tradeId];
-        require(trade.delivered, "Delivery not confirmed");
-        require(!trade.completed, "Payments already settled");
-
-        trade.completed = true;
-
-        uint256 productEscrowFee = (trade.productCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
-        uint256 sellerAmount = trade.productCost - productEscrowFee;
-        if (trade.isUSDT) {
-            require(usdt.transfer(trade.seller, sellerAmount), "USDT transfer to seller failed");
-        } else {
-            payable(trade.seller).transfer(sellerAmount);
-        }
-
-        uint256 logisticsAmount = 0;
-        if (trade.logisticsSelected) {
-            uint256 logisticsEscrowFee = (trade.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
-            logisticsAmount = trade.logisticsCost - logisticsEscrowFee;
-            if (trade.isUSDT) {
-                require(usdt.transfer(trade.chosenLogisticsProvider, logisticsAmount), "USDT transfer to logistics failed");
-            } else {
-                payable(trade.chosenLogisticsProvider).transfer(logisticsAmount);
+    // Helper function to find logistics cost
+    function _findLogisticsCost(Trade storage trade, address logisticsProvider) 
+        internal view returns (uint256) {
+        for (uint256 i = 0; i < trade.logisticsProviders.length; i++) {
+            if (trade.logisticsProviders[i] == logisticsProvider) {
+                return trade.logisticsCosts[i];
             }
         }
+        revert InvalidLogisticsProvider(logisticsProvider);
+    }
 
-        emit PaymentSettled(tradeId, sellerAmount, logisticsAmount, trade.isUSDT);
+    // Helper function to calculate trade costs (modified to return only needed values)
+    function _calculateTradeCosts(Trade storage trade, uint256 quantity, uint256 chosenLogisticsCost)
+        internal view returns (uint256 totalLogisticsCost, uint256 totalAmount) {
+        uint256 totalProductCost = trade.productCost * quantity;
+        totalLogisticsCost = chosenLogisticsCost * quantity;
+        totalAmount = totalProductCost + totalLogisticsCost;
+    }
+
+    // Helper function to validate and transfer USDT
+    function _validateAndTransferUSDT(uint256 totalAmount) internal {
+        uint256 allowance = usdt.allowance(msg.sender, address(this));
+        if (allowance < totalAmount) revert InsufficientUSDTAllowance(totalAmount, allowance);
+
+        uint256 balance = usdt.balanceOf(msg.sender);
+        if (balance < totalAmount) revert InsufficientUSDTBalance(totalAmount, balance);
+
+        require(usdt.transferFrom(msg.sender, address(this), totalAmount), "USDT transfer failed");
+    }
+
+    // Get purchase details
+    function getPurchase(uint256 purchaseId) external view returns (Purchase memory) {
+        if (purchases[purchaseId].tradeId == 0) revert PurchaseNotFound(purchaseId);
+        return purchases[purchaseId];
+    }
+
+    // Get trade details
+    function getTrade(uint256 tradeId) external view returns (Trade memory) {
+        if (trades[tradeId].seller == address(0)) revert TradeNotFound(tradeId);
+        return trades[tradeId];
+    }
+
+    // Get buyer's purchases
+    function getBuyerPurchases() external view returns (Purchase[] memory) {
+        uint256[] memory purchaseIds = buyerPurchaseIds[msg.sender];
+        Purchase[] memory buyerPurchases = new Purchase[](purchaseIds.length);
+        for (uint256 i = 0; i < purchaseIds.length; i++) {
+            buyerPurchases[i] = purchases[purchaseIds[i]];
+        }
+        return buyerPurchases;
+    }
+
+    // Get seller's trades
+    function getSellerTrades() external view returns (Trade[] memory) {
+        uint256[] memory tradeIds = sellerTradeIds[msg.sender];
+        Trade[] memory sellerTrades = new Trade[](tradeIds.length);
+        for (uint256 i = 0; i < tradeIds.length; i++) {
+            sellerTrades[i] = trades[tradeIds[i]];
+        }
+        return sellerTrades;
+    }
+
+    // Get provider's trades
+    function getProviderTrades() external view returns (Purchase[] memory) {
+        uint256[] memory purchaseIds = providerTradeIds[msg.sender];
+        Purchase[] memory providerTrades = new Purchase[](purchaseIds.length);
+        for (uint256 i = 0; i < purchaseIds.length; i++) {
+            providerTrades[i] = purchases[purchaseIds[i]];
+        }
+        return providerTrades;
+    }
+
+    // Confirm delivery
+    function confirmDelivery(uint256 purchaseId) external {
+        Purchase storage purchase = purchases[purchaseId];
+        if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
+        if (msg.sender != purchase.buyer) revert NotAuthorized(msg.sender, "buyer");
+        if (purchase.delivered) revert InvalidPurchaseState(purchaseId, "not delivered");
+        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "not disputed");
+        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "not confirmed");
+
+        purchase.delivered = true;
+        emit DeliveryConfirmed(purchaseId);
+    }
+
+    // Confirm purchase (after delivery)
+    function confirmPurchase(uint256 purchaseId) external {
+        Purchase storage purchase = purchases[purchaseId];
+        if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
+        if (msg.sender != purchase.buyer) revert NotAuthorized(msg.sender, "buyer");
+        if (!purchase.delivered) revert InvalidPurchaseState(purchaseId, "delivered");
+        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "not disputed");
+        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "not confirmed");
+
+        purchase.confirmed = true;
+        emit PurchaseConfirmed(purchaseId);
+        _settlePayments(purchaseId);
+    }
+
+    // Settle payments
+    function _settlePayments(uint256 purchaseId) internal {
+        Purchase storage purchase = purchases[purchaseId];
+        Trade storage trade = trades[purchase.tradeId];
+        
+        if (!purchase.confirmed) revert InvalidPurchaseState(purchaseId, "confirmed");
+
+        uint256 productEscrowFee = (trade.productCost * ESCROW_FEE_PERCENT * purchase.quantity) / BASIS_POINTS;
+        uint256 sellerAmount = (trade.productCost * purchase.quantity) - productEscrowFee;
+        require(usdt.transfer(trade.seller, sellerAmount), "USDT transfer to seller failed");
+
+        uint256 logisticsAmount = 0;
+        if (purchase.chosenLogisticsProvider != address(0)) {
+            uint256 logisticsEscrowFee = (purchase.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
+            logisticsAmount = purchase.logisticsCost - logisticsEscrowFee;
+            require(usdt.transfer(purchase.chosenLogisticsProvider, logisticsAmount), "USDT transfer to logistics failed");
+        }
+
+        emit PaymentSettled(purchaseId, sellerAmount, logisticsAmount);
     }
 
     // Raise dispute
-    function raiseDispute(uint256 tradeId) external onlyTradeParticipant(tradeId) {
-        Trade storage trade = trades[tradeId];
-        require(!trade.completed, "Trade already completed");
-        require(!trade.disputed, "Dispute already raised");
+    function raiseDispute(uint256 purchaseId) external onlyPurchaseParticipant(purchaseId) {
+        Purchase storage purchase = purchases[purchaseId];
+        if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
+        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "not confirmed");
+        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "not disputed");
 
-        trade.disputed = true;
-        emit DisputeRaised(tradeId, msg.sender);
+        purchase.disputed = true;
+        emit DisputeRaised(purchaseId, msg.sender);
     }
 
-    // Resolve dispute (admin)
-    function resolveDispute(uint256 tradeId, address winner) external onlyOwner {
-        Trade storage trade = trades[tradeId];
-        require(trade.disputed, "No active dispute");
-        require(!disputesResolved[tradeId], "Dispute already resolved");
-        require(
-            winner == trade.buyer || winner == trade.seller || winner == trade.chosenLogisticsProvider,
-            "Invalid winner"
-        );
+    // Resolve dispute
+    function resolveDispute(uint256 purchaseId, address winner) external onlyOwner {
+        Purchase storage purchase = purchases[purchaseId];
+        Trade storage trade = trades[purchase.tradeId];
+        if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
+        if (!purchase.disputed) revert InvalidPurchaseState(purchaseId, "disputed");
+        if (disputesResolved[purchaseId]) revert InvalidPurchaseState(purchaseId, "not resolved");
 
-        disputesResolved[tradeId] = true;
-        trade.completed = true;
+        bool validWinner = winner == purchase.buyer || winner == trade.seller || winner == purchase.chosenLogisticsProvider;
+        if (!validWinner) revert NotAuthorized(winner, "trade participant");
 
-        if (winner == trade.buyer) {
-            if (trade.isUSDT) {
-                require(usdt.transfer(trade.buyer, trade.totalAmount), "USDT refund failed");
-            } else {
-                payable(trade.buyer).transfer(trade.totalAmount);
-            }
+        disputesResolved[purchaseId] = true;
+        purchase.confirmed = true;
+
+        if (winner == purchase.buyer) {
+            require(usdt.transfer(purchase.buyer, purchase.totalAmount), "USDT refund failed");
         } else {
-            uint256 productEscrowFee = (trade.productCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
-            uint256 sellerAmount = trade.productCost - productEscrowFee;
-            if (trade.isUSDT) {
-                require(usdt.transfer(trade.seller, sellerAmount), "USDT transfer to seller failed");
-            } else {
-                payable(trade.seller).transfer(sellerAmount);
-            }
-            if (trade.logisticsSelected) {
-                uint256 logisticsEscrowFee = (trade.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
-                uint256 logisticsPayout = trade.logisticsCost - logisticsEscrowFee;
-                if (trade.isUSDT) {
-                    require(usdt.transfer(trade.chosenLogisticsProvider, logisticsPayout), "USDT transfer to logistics failed");
-                } else {
-                    payable(trade.chosenLogisticsProvider).transfer(logisticsPayout);
-                }
+            uint256 productEscrowFee = (trade.productCost * ESCROW_FEE_PERCENT * purchase.quantity) / BASIS_POINTS;
+            uint256 sellerAmount = (trade.productCost * purchase.quantity) - productEscrowFee;
+            require(usdt.transfer(trade.seller, sellerAmount), "USDT transfer to seller failed");
+
+            if (purchase.chosenLogisticsProvider != address(0)) {
+                uint256 logisticsEscrowFee = (purchase.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
+                uint256 logisticsPayout = purchase.logisticsCost - logisticsEscrowFee;
+                require(usdt.transfer(purchase.chosenLogisticsProvider, logisticsPayout), "USDT transfer to logistics failed");
             }
         }
 
-        emit DisputeResolved(tradeId, winner, trade.isUSDT);
+        emit DisputeResolved(purchaseId, winner);
     }
 
-    // Admin withdraw escrow fees (ETH)
-    function withdrawEscrowFeesETH() external onlyOwner {
-        uint256 balance = address(this).balance;
-        require(balance > 0, "No ETH fees to withdraw");
-        payable(owner()).transfer(balance);
+    // Cancel purchase
+    function cancelPurchase(uint256 purchaseId) external {
+        Purchase storage purchase = purchases[purchaseId];
+        Trade storage trade = trades[purchase.tradeId];
+        if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
+        if (msg.sender != purchase.buyer) revert NotAuthorized(msg.sender, "buyer");
+        if (purchase.delivered) revert InvalidPurchaseState(purchaseId, "not delivered");
+        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "not disputed");
+        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "not confirmed");
+
+        purchase.confirmed = true;
+        trade.remainingQuantity += purchase.quantity;
+        require(usdt.transfer(purchase.buyer, purchase.totalAmount), "USDT refund failed");
     }
 
-    // Admin withdraw escrow fees (USDT)
-    function withdrawEscrowFeesUSDT() external onlyOwner {
+    // Admin withdraw escrow fees
+    function withdrawEscrowFees() external onlyOwner {
         uint256 balance = usdt.balanceOf(address(this));
-        require(balance > 0, "No USDT fees to withdraw");
+        if (balance == 0) revert("No USDT fees to withdraw");
         require(usdt.transfer(owner(), balance), "USDT withdrawal failed");
-    }
-
-    // Refund if trade canceled (before delivery)
-    function cancelTrade(uint256 tradeId) external {
-        Trade storage trade = trades[tradeId];
-        require(msg.sender == trade.buyer, "Only buyer can cancel");
-        require(!trade.delivered, "Delivery already confirmed");
-        require(!trade.disputed, "Trade in dispute");
-        require(!trade.completed, "Trade already completed");
-
-        trade.completed = true;
-        if (trade.isUSDT) {
-            require(usdt.transfer(trade.buyer, trade.totalAmount), "USDT refund failed");
-        } else {
-            payable(trade.buyer).transfer(trade.totalAmount);
-        }
     }
 }
