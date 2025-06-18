@@ -2,9 +2,13 @@
 pragma solidity ^0.8.20;
 
 import "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import "../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../lib/openzeppelin-contracts/contracts/access/Ownable.sol";
+import "../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
-contract DezenMartLogistics is Ownable {
+contract DezenMartLogistics is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    
     // Constants
     uint256 public constant ESCROW_FEE_PERCENT = 250; // 2.5% (in basis points, 10000 = 100%)
     uint256 public constant BASIS_POINTS = 10000;
@@ -28,6 +32,7 @@ contract DezenMartLogistics is Ownable {
         bool disputed;
         address chosenLogisticsProvider;
         uint256 logisticsCost;
+        bool settled; // Track if payments have been settled
     }
 
     // Trade structure
@@ -65,6 +70,7 @@ contract DezenMartLogistics is Ownable {
     event DisputeResolved(uint256 indexed purchaseId, address winner);
     event LogisticsProviderRegistered(address indexed provider);
     event TradeStatusUpdated(uint256 indexed tradeId, string status);
+    event TradeDeactivated(uint256 indexed tradeId);
 
     // Errors
     error InsufficientUSDTAllowance(uint256 needed, uint256 allowance);
@@ -82,6 +88,7 @@ contract DezenMartLogistics is Ownable {
     error NotAuthorized(address caller, string role);
     error InvalidTradeState(uint256 tradeId, string expectedState);
     error InvalidPurchaseState(uint256 purchaseId, string expectedState);
+    error AlreadySettled(uint256 purchaseId);
 
     // Modifier for purchase participants
     modifier onlyPurchaseParticipant(uint256 purchaseId) {
@@ -163,7 +170,7 @@ contract DezenMartLogistics is Ownable {
     }
 
     // Buyer purchases a trade
-    function buyTrade(uint256 tradeId, uint256 quantity, address logisticsProvider) external returns (uint256) {
+    function buyTrade(uint256 tradeId, uint256 quantity, address logisticsProvider) external nonReentrant returns (uint256) {
         registerBuyer();
         Trade storage trade = trades[tradeId];
         if (!trade.active) revert InvalidTradeId(tradeId);
@@ -181,7 +188,7 @@ contract DezenMartLogistics is Ownable {
         // Validate and transfer USDT
         _validateAndTransferUSDT(totalAmount);
 
-        // Create new purchase
+        // Update state first (checks-effects-interactions pattern)
         purchaseCounter++;
         uint256 purchaseId = purchaseCounter;
 
@@ -195,12 +202,20 @@ contract DezenMartLogistics is Ownable {
             confirmed: false,
             disputed: false,
             chosenLogisticsProvider: logisticsProvider,
-            logisticsCost: totalLogisticsCost
+            logisticsCost: totalLogisticsCost,
+            settled: false
         });
 
-        // Update state
+        // Update trade state
         trade.purchaseIds.push(purchaseId);
         trade.remainingQuantity -= quantity;
+        
+        // Check if trade should be deactivated
+        if (trade.remainingQuantity == 0) {
+            trade.active = false;
+            emit TradeDeactivated(tradeId);
+        }
+        
         buyerPurchaseIds[msg.sender].push(purchaseId);
         providerTradeIds[logisticsProvider].push(purchaseId);
 
@@ -239,7 +254,7 @@ contract DezenMartLogistics is Ownable {
         uint256 balance = usdt.balanceOf(msg.sender);
         if (balance < totalAmount) revert InsufficientUSDTBalance(totalAmount, balance);
 
-        require(usdt.transferFrom(msg.sender, address(this), totalAmount), "USDT transfer failed");
+        usdt.safeTransferFrom(msg.sender, address(this), totalAmount);
     }
 
     // Get purchase details
@@ -284,49 +299,56 @@ contract DezenMartLogistics is Ownable {
         return providerTrades;
     }
 
-    // Confirm delivery
+    // Confirm delivery - CORRECTED STATE VALIDATION
     function confirmDelivery(uint256 purchaseId) external {
         Purchase storage purchase = purchases[purchaseId];
         if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
         if (msg.sender != purchase.buyer) revert NotAuthorized(msg.sender, "buyer");
-        if (purchase.delivered) revert InvalidPurchaseState(purchaseId, "not delivered");
-        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "not disputed");
-        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "not confirmed");
+        if (purchase.delivered) revert InvalidPurchaseState(purchaseId, "already delivered");
+        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "disputed");
+        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
 
         purchase.delivered = true;
         emit DeliveryConfirmed(purchaseId);
     }
 
-    // Confirm purchase (after delivery)
-    function confirmPurchase(uint256 purchaseId) external {
+    // Confirm purchase (after delivery) - CORRECTED STATE VALIDATION
+    function confirmPurchase(uint256 purchaseId) external nonReentrant {
         Purchase storage purchase = purchases[purchaseId];
         if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
         if (msg.sender != purchase.buyer) revert NotAuthorized(msg.sender, "buyer");
-        if (!purchase.delivered) revert InvalidPurchaseState(purchaseId, "delivered");
-        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "not disputed");
-        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "not confirmed");
+        if (!purchase.delivered) revert InvalidPurchaseState(purchaseId, "not delivered");
+        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "disputed");
+        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
+        if (purchase.settled) revert AlreadySettled(purchaseId);
 
+        // Update state before external calls (checks-effects-interactions)
         purchase.confirmed = true;
+        purchase.settled = true;
+        
         emit PurchaseConfirmed(purchaseId);
         _settlePayments(purchaseId);
     }
 
-    // Settle payments
+    // Settle payments - CORRECTED REENTRANCY PROTECTION
     function _settlePayments(uint256 purchaseId) internal {
         Purchase storage purchase = purchases[purchaseId];
         Trade storage trade = trades[purchase.tradeId];
         
-        if (!purchase.confirmed) revert InvalidPurchaseState(purchaseId, "confirmed");
+        if (!purchase.confirmed) revert InvalidPurchaseState(purchaseId, "not confirmed");
+        if (purchase.settled) revert AlreadySettled(purchaseId);
 
         uint256 productEscrowFee = (trade.productCost * ESCROW_FEE_PERCENT * purchase.quantity) / BASIS_POINTS;
         uint256 sellerAmount = (trade.productCost * purchase.quantity) - productEscrowFee;
-        require(usdt.transfer(trade.seller, sellerAmount), "USDT transfer to seller failed");
+        
+        // Use SafeERC20 for secure transfers
+        usdt.safeTransfer(trade.seller, sellerAmount);
 
         uint256 logisticsAmount = 0;
         if (purchase.chosenLogisticsProvider != address(0)) {
             uint256 logisticsEscrowFee = (purchase.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
             logisticsAmount = purchase.logisticsCost - logisticsEscrowFee;
-            require(usdt.transfer(purchase.chosenLogisticsProvider, logisticsAmount), "USDT transfer to logistics failed");
+            usdt.safeTransfer(purchase.chosenLogisticsProvider, logisticsAmount);
         }
 
         emit PaymentSettled(purchaseId, sellerAmount, logisticsAmount);
@@ -336,63 +358,82 @@ contract DezenMartLogistics is Ownable {
     function raiseDispute(uint256 purchaseId) external onlyPurchaseParticipant(purchaseId) {
         Purchase storage purchase = purchases[purchaseId];
         if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
-        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "not confirmed");
-        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "not disputed");
+        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
+        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "already disputed");
 
         purchase.disputed = true;
         emit DisputeRaised(purchaseId, msg.sender);
     }
 
-    // Resolve dispute
-    function resolveDispute(uint256 purchaseId, address winner) external onlyOwner {
+    // Resolve dispute - CORRECTED LOGIC AND REENTRANCY PROTECTION
+    function resolveDispute(uint256 purchaseId, address winner) external onlyOwner nonReentrant {
         Purchase storage purchase = purchases[purchaseId];
         Trade storage trade = trades[purchase.tradeId];
         if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
-        if (!purchase.disputed) revert InvalidPurchaseState(purchaseId, "disputed");
-        if (disputesResolved[purchaseId]) revert InvalidPurchaseState(purchaseId, "not resolved");
+        if (!purchase.disputed) revert InvalidPurchaseState(purchaseId, "not disputed");
+        if (disputesResolved[purchaseId]) revert InvalidPurchaseState(purchaseId, "already resolved");
+        if (purchase.settled) revert AlreadySettled(purchaseId);
 
         bool validWinner = winner == purchase.buyer || winner == trade.seller || winner == purchase.chosenLogisticsProvider;
         if (!validWinner) revert NotAuthorized(winner, "trade participant");
 
+        // Update state before external calls (checks-effects-interactions)
         disputesResolved[purchaseId] = true;
         purchase.confirmed = true;
+        purchase.settled = true;
 
         if (winner == purchase.buyer) {
-            require(usdt.transfer(purchase.buyer, purchase.totalAmount), "USDT refund failed");
+            // Refund buyer
+            usdt.safeTransfer(purchase.buyer, purchase.totalAmount);
+            // Restore quantity to trade since buyer gets refund
+            trade.remainingQuantity += purchase.quantity;
+            if (!trade.active && trade.remainingQuantity > 0) {
+                trade.active = true;
+            }
         } else {
+            // Pay seller and logistics provider
             uint256 productEscrowFee = (trade.productCost * ESCROW_FEE_PERCENT * purchase.quantity) / BASIS_POINTS;
             uint256 sellerAmount = (trade.productCost * purchase.quantity) - productEscrowFee;
-            require(usdt.transfer(trade.seller, sellerAmount), "USDT transfer to seller failed");
+            usdt.safeTransfer(trade.seller, sellerAmount);
 
             if (purchase.chosenLogisticsProvider != address(0)) {
                 uint256 logisticsEscrowFee = (purchase.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
                 uint256 logisticsPayout = purchase.logisticsCost - logisticsEscrowFee;
-                require(usdt.transfer(purchase.chosenLogisticsProvider, logisticsPayout), "USDT transfer to logistics failed");
+                usdt.safeTransfer(purchase.chosenLogisticsProvider, logisticsPayout);
             }
         }
 
         emit DisputeResolved(purchaseId, winner);
     }
 
-    // Cancel purchase
-    function cancelPurchase(uint256 purchaseId) external {
+    // Cancel purchase - CORRECTED STATE VALIDATION
+    function cancelPurchase(uint256 purchaseId) external nonReentrant {
         Purchase storage purchase = purchases[purchaseId];
         Trade storage trade = trades[purchase.tradeId];
         if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
         if (msg.sender != purchase.buyer) revert NotAuthorized(msg.sender, "buyer");
-        if (purchase.delivered) revert InvalidPurchaseState(purchaseId, "not delivered");
-        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "not disputed");
-        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "not confirmed");
+        if (purchase.delivered) revert InvalidPurchaseState(purchaseId, "already delivered");
+        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "disputed");
+        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
+        if (purchase.settled) revert AlreadySettled(purchaseId);
 
+        // Update state before external calls (checks-effects-interactions)
         purchase.confirmed = true;
+        purchase.settled = true;
         trade.remainingQuantity += purchase.quantity;
-        require(usdt.transfer(purchase.buyer, purchase.totalAmount), "USDT refund failed");
+        
+        // Reactivate trade if it was deactivated
+        if (!trade.active && trade.remainingQuantity > 0) {
+            trade.active = true;
+        }
+        
+        usdt.safeTransfer(purchase.buyer, purchase.totalAmount);
     }
 
     // Admin withdraw escrow fees
-    function withdrawEscrowFees() external onlyOwner {
+    function withdrawEscrowFees() external onlyOwner nonReentrant {
         uint256 balance = usdt.balanceOf(address(this));
-        if (balance == 0) revert("No USDT fees to withdraw");
-        require(usdt.transfer(owner(), balance), "USDT withdrawal failed");
+        require(balance > 0, "No USDT fees to withdraw");
+        usdt.safeTransfer(owner(), balance);
     }
 }
