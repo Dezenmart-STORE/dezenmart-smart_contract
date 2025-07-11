@@ -14,7 +14,6 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
     uint256 public constant BASIS_POINTS = 10000;
 
     // Roles
-    IERC20 public immutable usdt;
     mapping(address => bool) public logisticsProviders;
     mapping(address => bool) public sellers;
     mapping(address => bool) public buyers; // Track registered buyers
@@ -46,6 +45,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         uint256 remainingQuantity;
         bool active;
         uint256[] purchaseIds; // Array of associated purchase IDs
+        address tokenAddress; // Token address for payment
     }
 
     // State variables
@@ -59,7 +59,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
     mapping(address => uint256[]) public providerTradeIds; // Logistics provider's trade IDs
 
     // Events
-    event TradeCreated(uint256 indexed tradeId, address indexed seller, uint256 productCost, uint256 totalQuantity);
+    event TradeCreated(uint256 indexed tradeId, address indexed seller, uint256 productCost, uint256 totalQuantity, address tokenAddress);
     event PurchaseCreated(uint256 indexed purchaseId, uint256 indexed tradeId, address indexed buyer, uint256 quantity);
     event LogisticsSelected(uint256 indexed purchaseId, address logisticsProvider, uint256 logisticsCost);
     event PaymentHeld(uint256 indexed purchaseId, uint256 totalAmount);
@@ -73,8 +73,8 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
     event TradeDeactivated(uint256 indexed tradeId);
 
     // Errors
-    error InsufficientUSDTAllowance(uint256 needed, uint256 allowance);
-    error InsufficientUSDTBalance(uint256 needed, uint256 balance);
+    error InsufficientTokenAllowance(uint256 needed, uint256 allowance);
+    error InsufficientTokenBalance(uint256 needed, uint256 balance);
     error InvalidTradeId(uint256 tradeId);
     error InvalidPurchaseId(uint256 purchaseId);
     error BuyerIsSeller();
@@ -89,6 +89,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
     error InvalidTradeState(uint256 tradeId, string expectedState);
     error InvalidPurchaseState(uint256 purchaseId, string expectedState);
     error AlreadySettled(uint256 purchaseId);
+    error InvalidTokenAddress(address tokenAddress);
 
     // Modifier for purchase participants
     modifier onlyPurchaseParticipant(uint256 purchaseId) {
@@ -100,13 +101,10 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         _;
     }
 
-    constructor(address _usdtAddress) Ownable(msg.sender) {
-        require(_usdtAddress != address(0), "Invalid USDT address");
-        usdt = IERC20(_usdtAddress);
-    }
+    constructor() Ownable(msg.sender) {}
 
     // Register logistics provider
-    function registerLogisticsProvider(address provider) external  {
+    function registerLogisticsProvider(address provider) external {
         require(provider != address(0), "Invalid provider address");
         require(!logisticsProviders[provider], "Provider already registered");
         logisticsProviders[provider] = true;
@@ -134,12 +132,14 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         uint256 productCost,
         address[] memory logisticsProvidersList,
         uint256[] memory logisticsCosts,
-        uint256 totalQuantity
+        uint256 totalQuantity,
+        address tokenAddress
     ) external returns (uint256) {
         registerSeller();
         if (totalQuantity == 0) revert InvalidQuantity(totalQuantity);
         if (logisticsProvidersList.length != logisticsCosts.length) revert MismatchedArrays(logisticsProvidersList.length, logisticsCosts.length);
         if (logisticsProvidersList.length == 0) revert NoLogisticsProviders();
+        if (tokenAddress == address(0)) revert InvalidTokenAddress(tokenAddress);
 
         for (uint256 i = 0; i < logisticsProvidersList.length; i++) {
             if (logisticsProvidersList[i] == address(0) || !logisticsProviders[logisticsProvidersList[i]]) 
@@ -161,11 +161,12 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
             totalQuantity: totalQuantity,
             remainingQuantity: totalQuantity,
             active: true,
-            purchaseIds: new uint256[](0)
+            purchaseIds: new uint256[](0),
+            tokenAddress: tokenAddress
         });
 
         sellerTradeIds[msg.sender].push(tradeId);
-        emit TradeCreated(tradeId, msg.sender, productCost, totalQuantity);
+        emit TradeCreated(tradeId, msg.sender, productCost, totalQuantity, tokenAddress);
         return tradeId;
     }
 
@@ -182,11 +183,11 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         // Validate logistics provider and get cost
         uint256 chosenLogisticsCost = _findLogisticsCost(trade, logisticsProvider);
 
-        // Calculate costs (only return needed values)
+        // Calculate costs
         (uint256 totalLogisticsCost, uint256 totalAmount) = _calculateTradeCosts(trade, quantity, chosenLogisticsCost);
 
-        // Validate and transfer USDT
-        _validateAndTransferUSDT(totalAmount);
+        // Validate and transfer token
+        _validateAndTransferToken(trade.tokenAddress, totalAmount);
 
         // Update state first (checks-effects-interactions pattern)
         purchaseCounter++;
@@ -238,7 +239,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         revert InvalidLogisticsProvider(logisticsProvider);
     }
 
-    // Helper function to calculate trade costs (modified to return only needed values)
+    // Helper function to calculate trade costs
     function _calculateTradeCosts(Trade storage trade, uint256 quantity, uint256 chosenLogisticsCost)
         internal view returns (uint256 totalLogisticsCost, uint256 totalAmount) {
         uint256 totalProductCost = trade.productCost * quantity;
@@ -246,15 +247,16 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         totalAmount = totalProductCost + totalLogisticsCost;
     }
 
-    // Helper function to validate and transfer USDT
-    function _validateAndTransferUSDT(uint256 totalAmount) internal {
-        uint256 allowance = usdt.allowance(msg.sender, address(this));
-        if (allowance < totalAmount) revert InsufficientUSDTAllowance(totalAmount, allowance);
+    // Helper function to validate and transfer token
+    function _validateAndTransferToken(address tokenAddress, uint256 totalAmount) internal {
+        IERC20 token = IERC20(tokenAddress);
+        uint256 allowance = token.allowance(msg.sender, address(this));
+        if (allowance < totalAmount) revert InsufficientTokenAllowance(totalAmount, allowance);
 
-        uint256 balance = usdt.balanceOf(msg.sender);
-        if (balance < totalAmount) revert InsufficientUSDTBalance(totalAmount, balance);
+        uint256 balance = token.balanceOf(msg.sender);
+        if (balance < totalAmount) revert InsufficientTokenBalance(totalAmount, balance);
 
-        usdt.safeTransferFrom(msg.sender, address(this), totalAmount);
+        token.safeTransferFrom(msg.sender, address(this), totalAmount);
     }
 
     // Get purchase details
@@ -299,7 +301,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         return providerTrades;
     }
 
-    // Confirm delivery - CORRECTED STATE VALIDATION
+    // Confirm delivery
     function confirmDelivery(uint256 purchaseId) external {
         Purchase storage purchase = purchases[purchaseId];
         if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
@@ -312,7 +314,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         emit DeliveryConfirmed(purchaseId);
     }
 
-    // Confirm purchase (after delivery) - CORRECTED STATE VALIDATION
+    // Confirm purchase (after delivery)
     function confirmPurchase(uint256 purchaseId) external nonReentrant {
         Purchase storage purchase = purchases[purchaseId];
         if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
@@ -322,7 +324,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
         if (purchase.settled) revert AlreadySettled(purchaseId);
 
-        // Update state before external calls (checks-effects-interactions)
+        // Update state before external calls
         purchase.confirmed = true;
         purchase.settled = true;
         
@@ -330,7 +332,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         _settlePayments(purchaseId);
     }
 
-    // Settle payments - CORRECTED REENTRANCY PROTECTION
+    // Settle payments
     function _settlePayments(uint256 purchaseId) internal {
         Purchase storage purchase = purchases[purchaseId];
         Trade storage trade = trades[purchase.tradeId];
@@ -338,17 +340,18 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         if (!purchase.confirmed) revert InvalidPurchaseState(purchaseId, "not confirmed");
         if (purchase.settled) revert AlreadySettled(purchaseId);
 
+        IERC20 token = IERC20(trade.tokenAddress);
         uint256 productEscrowFee = (trade.productCost * ESCROW_FEE_PERCENT * purchase.quantity) / BASIS_POINTS;
         uint256 sellerAmount = (trade.productCost * purchase.quantity) - productEscrowFee;
         
         // Use SafeERC20 for secure transfers
-        usdt.safeTransfer(trade.seller, sellerAmount);
+        token.safeTransfer(trade.seller, sellerAmount);
 
         uint256 logisticsAmount = 0;
         if (purchase.chosenLogisticsProvider != address(0)) {
             uint256 logisticsEscrowFee = (purchase.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
             logisticsAmount = purchase.logisticsCost - logisticsEscrowFee;
-            usdt.safeTransfer(purchase.chosenLogisticsProvider, logisticsAmount);
+            token.safeTransfer(purchase.chosenLogisticsProvider, logisticsAmount);
         }
 
         emit PaymentSettled(purchaseId, sellerAmount, logisticsAmount);
@@ -365,7 +368,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         emit DisputeRaised(purchaseId, msg.sender);
     }
 
-    // Resolve dispute - CORRECTED LOGIC AND REENTRANCY PROTECTION
+    // Resolve dispute
     function resolveDispute(uint256 purchaseId, address winner) external onlyOwner nonReentrant {
         Purchase storage purchase = purchases[purchaseId];
         Trade storage trade = trades[purchase.tradeId];
@@ -377,14 +380,15 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         bool validWinner = winner == purchase.buyer || winner == trade.seller || winner == purchase.chosenLogisticsProvider;
         if (!validWinner) revert NotAuthorized(winner, "trade participant");
 
-        // Update state before external calls (checks-effects-interactions)
+        // Update state before external calls
         disputesResolved[purchaseId] = true;
         purchase.confirmed = true;
         purchase.settled = true;
 
+        IERC20 token = IERC20(trade.tokenAddress);
         if (winner == purchase.buyer) {
             // Refund buyer
-            usdt.safeTransfer(purchase.buyer, purchase.totalAmount);
+            token.safeTransfer(purchase.buyer, purchase.totalAmount);
             // Restore quantity to trade since buyer gets refund
             trade.remainingQuantity += purchase.quantity;
             if (!trade.active && trade.remainingQuantity > 0) {
@@ -394,19 +398,19 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
             // Pay seller and logistics provider
             uint256 productEscrowFee = (trade.productCost * ESCROW_FEE_PERCENT * purchase.quantity) / BASIS_POINTS;
             uint256 sellerAmount = (trade.productCost * purchase.quantity) - productEscrowFee;
-            usdt.safeTransfer(trade.seller, sellerAmount);
+            token.safeTransfer(trade.seller, sellerAmount);
 
             if (purchase.chosenLogisticsProvider != address(0)) {
                 uint256 logisticsEscrowFee = (purchase.logisticsCost * ESCROW_FEE_PERCENT) / BASIS_POINTS;
                 uint256 logisticsPayout = purchase.logisticsCost - logisticsEscrowFee;
-                usdt.safeTransfer(purchase.chosenLogisticsProvider, logisticsPayout);
+                token.safeTransfer(purchase.chosenLogisticsProvider, logisticsPayout);
             }
         }
 
         emit DisputeResolved(purchaseId, winner);
     }
 
-    // Cancel purchase - CORRECTED STATE VALIDATION
+    // Cancel purchase
     function cancelPurchase(uint256 purchaseId) external nonReentrant {
         Purchase storage purchase = purchases[purchaseId];
         Trade storage trade = trades[purchase.tradeId];
@@ -417,7 +421,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
         if (purchase.settled) revert AlreadySettled(purchaseId);
 
-        // Update state before external calls (checks-effects-interactions)
+        // Update state before external calls
         purchase.confirmed = true;
         purchase.settled = true;
         trade.remainingQuantity += purchase.quantity;
@@ -427,13 +431,15 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
             trade.active = true;
         }
         
-        usdt.safeTransfer(purchase.buyer, purchase.totalAmount);
+        IERC20 token = IERC20(trade.tokenAddress);
+        token.safeTransfer(purchase.buyer, purchase.totalAmount);
     }
 
     // Admin withdraw escrow fees
-    function withdrawEscrowFees() external onlyOwner nonReentrant {
-        uint256 balance = usdt.balanceOf(address(this));
-        require(balance > 0, "No USDT fees to withdraw");
-        usdt.safeTransfer(owner(), balance);
+    function withdrawEscrowFees(address tokenAddress) external onlyOwner nonReentrant {
+        IERC20 token = IERC20(tokenAddress);
+        uint256 balance = token.balanceOf(address(this));
+        require(balance > 0, "No token fees to withdraw");
+        token.safeTransfer(owner(), balance);
     }
 }
