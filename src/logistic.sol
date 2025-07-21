@@ -26,8 +26,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         address buyer;
         uint256 quantity;
         uint256 totalAmount;
-        bool delivered;
-        bool confirmed;
+        bool deliveredAndConfirmed; // Combined delivery and confirmation status
         bool disputed;
         address chosenLogisticsProvider;
         uint256 logisticsCost;
@@ -63,8 +62,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
     event PurchaseCreated(uint256 indexed purchaseId, uint256 indexed tradeId, address indexed buyer, uint256 quantity);
     event LogisticsSelected(uint256 indexed purchaseId, address logisticsProvider, uint256 logisticsCost);
     event PaymentHeld(uint256 indexed purchaseId, uint256 totalAmount);
-    event DeliveryConfirmed(uint256 indexed purchaseId);
-    event PurchaseConfirmed(uint256 indexed purchaseId);
+    event PurchaseCompletedAndConfirmed(uint256 indexed purchaseId); // Combined event
     event PaymentSettled(uint256 indexed purchaseId, uint256 sellerAmount, uint256 logisticsAmount);
     event DisputeRaised(uint256 indexed purchaseId, address initiator);
     event DisputeResolved(uint256 indexed purchaseId, address winner);
@@ -90,6 +88,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
     error InvalidPurchaseState(uint256 purchaseId, string expectedState);
     error AlreadySettled(uint256 purchaseId);
     error InvalidTokenAddress(address tokenAddress);
+    error InvalidSellerAddress(address seller);
 
     // Modifier for purchase participants
     modifier onlyPurchaseParticipant(uint256 purchaseId) {
@@ -123,23 +122,30 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
     }
 
     // Register seller
-    function registerSeller() public {
-        sellers[msg.sender] = true;
+    function registerSeller(address seller) external onlyOwner {
+        require(seller != address(0), "Invalid seller address");
+        sellers[seller] = true;
     }
 
-    // Seller creates a trade
+    // Owner creates a trade with specified seller
     function createTrade(
+        address seller,
         uint256 productCost,
         address[] memory logisticsProvidersList,
         uint256[] memory logisticsCosts,
         uint256 totalQuantity,
         address tokenAddress
-    ) external returns (uint256) {
-        registerSeller();
+    ) external onlyOwner returns (uint256) {
+        if (seller == address(0)) revert InvalidSellerAddress(seller);
         if (totalQuantity == 0) revert InvalidQuantity(totalQuantity);
         if (logisticsProvidersList.length != logisticsCosts.length) revert MismatchedArrays(logisticsProvidersList.length, logisticsCosts.length);
         if (logisticsProvidersList.length == 0) revert NoLogisticsProviders();
         if (tokenAddress == address(0)) revert InvalidTokenAddress(tokenAddress);
+
+        // Register seller if not already registered
+        if (!sellers[seller]) {
+            sellers[seller] = true;
+        }
 
         for (uint256 i = 0; i < logisticsProvidersList.length; i++) {
             if (logisticsProvidersList[i] == address(0) || !logisticsProviders[logisticsProvidersList[i]]) 
@@ -153,7 +159,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         uint256 tradeId = tradeCounter;
 
         trades[tradeId] = Trade({
-            seller: msg.sender,
+            seller: seller,
             logisticsProviders: logisticsProvidersList,
             logisticsCosts: logisticsCosts,
             productCost: productCost,
@@ -165,8 +171,8 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
             tokenAddress: tokenAddress
         });
 
-        sellerTradeIds[msg.sender].push(tradeId);
-        emit TradeCreated(tradeId, msg.sender, productCost, totalQuantity, tokenAddress);
+        sellerTradeIds[seller].push(tradeId);
+        emit TradeCreated(tradeId, seller, productCost, totalQuantity, tokenAddress);
         return tradeId;
     }
 
@@ -199,8 +205,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
             buyer: msg.sender,
             quantity: quantity,
             totalAmount: totalAmount,
-            delivered: false,
-            confirmed: false,
+            deliveredAndConfirmed: false, // Combined status
             disputed: false,
             chosenLogisticsProvider: logisticsProvider,
             logisticsCost: totalLogisticsCost,
@@ -301,31 +306,17 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         return providerTrades;
     }
 
-    // Confirm delivery
-    function confirmDelivery(uint256 purchaseId) external {
+    // Combined confirm delivery and purchase (replaces both previous functions)
+    function confirmDeliveryAndPurchase(uint256 purchaseId) external nonReentrant {
         Purchase storage purchase = purchases[purchaseId];
         if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
         if (msg.sender != purchase.buyer) revert NotAuthorized(msg.sender, "buyer");
-        if (purchase.delivered) revert InvalidPurchaseState(purchaseId, "already delivered");
+        if (purchase.deliveredAndConfirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
         if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "disputed");
-        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
-
-        purchase.delivered = true;
-        emit DeliveryConfirmed(purchaseId);
-    }
-
-    // Confirm purchase (after delivery)
-    function confirmPurchase(uint256 purchaseId) external nonReentrant {
-        Purchase storage purchase = purchases[purchaseId];
-        if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
-        if (msg.sender != purchase.buyer) revert NotAuthorized(msg.sender, "buyer");
-        if (!purchase.delivered) revert InvalidPurchaseState(purchaseId, "not delivered");
-        if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "disputed");
-        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
         if (purchase.settled) revert AlreadySettled(purchaseId);
 
         // Update confirmed state
-        purchase.confirmed = true;
+        purchase.deliveredAndConfirmed = true;
         
         // Settle payments
         _settlePayments(purchaseId);
@@ -333,7 +324,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         // Update settled state after successful payment
         purchase.settled = true;
         
-        emit PurchaseConfirmed(purchaseId);
+        emit PurchaseCompletedAndConfirmed(purchaseId);
     }
 
     // Settle payments
@@ -362,7 +353,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
     function raiseDispute(uint256 purchaseId) external onlyPurchaseParticipant(purchaseId) {
         Purchase storage purchase = purchases[purchaseId];
         if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
-        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
+        if (purchase.deliveredAndConfirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
         if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "already disputed");
 
         purchase.disputed = true;
@@ -383,7 +374,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
 
         // Update state before external calls
         disputesResolved[purchaseId] = true;
-        purchase.confirmed = true;
+        purchase.deliveredAndConfirmed = true;
         purchase.settled = true;
 
         IERC20 token = IERC20(trade.tokenAddress);
@@ -417,13 +408,12 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         Trade storage trade = trades[purchase.tradeId];
         if (purchase.tradeId == 0) revert PurchaseNotFound(purchaseId);
         if (msg.sender != purchase.buyer) revert NotAuthorized(msg.sender, "buyer");
-        if (purchase.delivered) revert InvalidPurchaseState(purchaseId, "already delivered");
+        if (purchase.deliveredAndConfirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
         if (purchase.disputed) revert InvalidPurchaseState(purchaseId, "disputed");
-        if (purchase.confirmed) revert InvalidPurchaseState(purchaseId, "already confirmed");
         if (purchase.settled) revert AlreadySettled(purchaseId);
 
         // Update state before external calls
-        purchase.confirmed = true;
+        purchase.deliveredAndConfirmed = true;
         purchase.settled = true;
         trade.remainingQuantity += purchase.quantity;
         
