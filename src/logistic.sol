@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import "../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import "../lib/openzeppelin-contracts/contracts/access/Ownable.sol";
+import "../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
 contract DezenMartLogistics is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -18,8 +18,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
     mapping(address => bool) public sellers;
     mapping(address => bool) public buyers;
     
-    // Logistics provider costs - provider address => cost per unit
-    mapping(address => uint256) public logisticsProviderCosts;
+    // Logistics providers list (for reference only, no costs stored here)
     address[] public registeredProviders;
 
     // Purchase structure for individual buyer purchases
@@ -67,8 +66,7 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
     event PaymentSettled(uint256 indexed purchaseId, uint256 sellerAmount, uint256 logisticsAmount);
     event DisputeRaised(uint256 indexed purchaseId, address initiator);
     event DisputeResolved(uint256 indexed purchaseId, address winner);
-    event LogisticsProviderRegistered(address indexed provider, uint256 costPerUnit);
-    event LogisticsProviderUpdated(address indexed provider, uint256 newCostPerUnit);
+    event LogisticsProviderRegistered(address indexed provider);
     event TradeDeactivated(uint256 indexed tradeId);
 
     // Errors
@@ -101,41 +99,20 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
 
     constructor() Ownable(msg.sender) {}
 
-    // Register logistics provider with their cost per unit
-    function registerLogisticsProvider(address provider, uint256 costPerUnit) external onlyOwner {
+    // Register logistics provider (no cost stored)
+    function registerLogisticsProvider(address provider) external onlyOwner {
         require(provider != address(0), "Invalid provider address");
-        require(costPerUnit > 0, "Cost must be greater than zero");
         
         if (!logisticsProviders[provider]) {
             logisticsProviders[provider] = true;
             registeredProviders.push(provider);
+            emit LogisticsProviderRegistered(provider);
         }
-        
-        logisticsProviderCosts[provider] = costPerUnit;
-        emit LogisticsProviderRegistered(provider, costPerUnit);
     }
 
-    // Update logistics provider cost
-    function updateLogisticsProviderCost(address provider, uint256 newCostPerUnit) external onlyOwner {
-        require(logisticsProviders[provider], "Provider not registered");
-        require(newCostPerUnit > 0, "Cost must be greater than zero");
-        
-        logisticsProviderCosts[provider] = newCostPerUnit;
-        emit LogisticsProviderUpdated(provider, newCostPerUnit);
-    }
-
-    // Get all registered logistics providers with their costs
-    function getLogisticsProviders() external view returns (address[] memory providers, uint256[] memory costs) {
-        uint256 length = registeredProviders.length;
-        providers = new address[](length);
-        costs = new uint256[](length);
-        
-        for (uint256 i = 0; i < length; i++) {
-            providers[i] = registeredProviders[i];
-            costs[i] = logisticsProviderCosts[registeredProviders[i]];
-        }
-        
-        return (providers, costs);
+    // Get all registered logistics providers
+    function getLogisticsProviders() external view returns (address[] memory providers) {
+        return registeredProviders;
     }
 
     // Register buyer
@@ -188,11 +165,12 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
         return tradeId;
     }
 
-    // Buyer purchases a trade and selects logistics provider
+    // Buyer purchases a trade with logistics provider and cost
     function buyTrade(
         uint256 tradeId,
         uint256 quantity,
-        address logisticsProvider
+        address logisticsProvider,
+        uint256 logisticsCost
     ) external nonReentrant returns (uint256) {
         registerBuyer();
 
@@ -205,14 +183,13 @@ contract DezenMartLogistics is Ownable, ReentrancyGuard {
 
         // Validate logistics provider is registered
         if (!logisticsProviders[logisticsProvider]) revert InvalidLogisticsProvider(logisticsProvider);
-        
-        // Get logistics cost from provider's rate
-        uint256 logisticsCostPerUnit = logisticsProviderCosts[logisticsProvider];
-        if (logisticsCostPerUnit == 0) revert InvalidLogisticsProvider(logisticsProvider);
+        if (logisticsCost == 0) revert InvalidQuantity(logisticsCost);
+
+        // Calculate total logistics cost for quantity
+        uint256 totalLogisticsCost = logisticsCost * quantity;
 
         // Calculate costs
         uint256 totalProductCost = trade.productCost * quantity;
-        uint256 totalLogisticsCost = logisticsCostPerUnit * quantity;
         uint256 totalAmount = totalProductCost + totalLogisticsCost;
 
         // Validate and transfer token
